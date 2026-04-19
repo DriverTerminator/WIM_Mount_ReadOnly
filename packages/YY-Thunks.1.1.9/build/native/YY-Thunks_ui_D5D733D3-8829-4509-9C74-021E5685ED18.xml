@@ -1,0 +1,57 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<ProjectSchemaDefinitions
+  xmlns="http://schemas.microsoft.com/build/2009/properties"
+  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" >
+  <Rule Name="CuyuTeam_D5D733D3-8829-4509-9C74-021E5685ED18"
+        PageTemplate="tool"
+        DisplayName="NuGet程序包设置">
+    <Rule.Categories>
+      <Category Name="YY_Thunks" DisplayName="YY-Thunks" />
+    </Rule.Categories>
+
+    <Rule.DataSource>
+      <DataSource Persistence="ProjectFile"
+                  ItemType=""
+                  Label="Configuration"
+                  HasConfigurationCondition="true"/>
+    </Rule.DataSource>
+
+    <EnumProperty
+      Name="WindowsTargetPlatformMinVersion"
+      Category="YY_Thunks"
+      DisplayName="最小兼容系统版本"
+      Description="YY-Thunks以最小版本为基准添加API兼容层，以便于早期平台可以正常使用新的API。最小兼容版本越高额外的兼容层越小，选择一个适合的目标可减少二进制文件体积。">
+      <EnumValue
+        Name="5.0.2195.0"
+        DisplayName="5.0.2195.0"/>
+
+      <EnumValue
+        Name="5.1.2600.0"
+        DisplayName="5.1.2600.0"/>
+
+      <EnumValue
+        Name="5.2.3790.0"
+        DisplayName="5.2.3790.0"/>
+
+      <EnumValue
+        Name="6.0.6000.0"
+        DisplayName="6.0.6000.0（默认）"/>
+      
+      <EnumValue
+        Name="6.1.7600.0"
+        DisplayName="6.1.7600.0"/>
+
+      <EnumValue
+        Name="6.2.9200.0"
+        DisplayName="6.2.9200.0"/>
+
+      <EnumValue
+        Name="10.0.10240.0"
+        DisplayName="10.0.10240.0"/>
+
+      <EnumValue
+        Name="10.0.19041.0"
+        DisplayName="10.0.19041.0"/>
+    </EnumProperty>
+  </Rule>
+</ProjectSchemaDefinitions>
