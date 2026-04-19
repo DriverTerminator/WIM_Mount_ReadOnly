@@ -16,4 +16,4 @@ https://github.com/ebiggers/wimlib
 使用 wimlib 解析 WIM 映像文件
 优先使用 Dokan 驱动挂载，如果没有 Dokan 则使用 winfsp（ARM64 目前只使用 winfsp）
 初始目标兼容： Windows XP至Windows 11，x86、x64、arm64
-下一阶段目标：改造 wimlib 使项目能支持 Windows 2000
+下一阶段目标：希望高手能帮忙改造 wimlib 使项目能支持 Windows 2000
