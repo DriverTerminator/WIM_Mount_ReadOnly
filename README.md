@@ -3,7 +3,7 @@
 
 此项目中使用的第三方库列表：
 
-Dokan v0.6.0
+Dokan v0.6.0（由于Dokan v0.6.0版官方安装包里未带x64的dokan.dll，所以本项目中的x64版dokan.dll为自编译版本）
 
 https://github.com/dokan-dev/dokany
 
