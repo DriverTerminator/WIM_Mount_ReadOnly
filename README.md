@@ -18,6 +18,15 @@ wimlib v1.13.6
 https://github.com/ebiggers/wimlib
 
 
+YY-Thunks
+
+https://github.com/Chuyu-Team/YY-Thunks
+
+VC-LTL5
+
+https://github.com/Chuyu-Team/VC-LTL5
+
+
 原理：
 使用 wimlib 解析 WIM 映像文件
 优先使用 Dokan 驱动挂载，如果没有 Dokan 则使用 winfsp（ARM64 目前只使用 winfsp）
