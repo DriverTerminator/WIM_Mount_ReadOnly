@@ -2,6 +2,7 @@
  * wimfs: read-only WIM/ESD/SWM image mount using WinFsp + wimlib.
  *
  * Usage: wim.exe <archive.wim|.esd> <mount-directory> [image-index]
+ *         wim.exe /unmount <mount-directory>  (Dokan or WinFsp directory mounts; see unmount_mountpoint)
  *
  * Requires: wimlib (libwim.lib + libwim-*.dll). WinFsp: headers third_party\WinFsp\inc,
  * libs third_party\WinFsp\lib (winfsp-{x86|x64|a64}.lib); at runtime place winfsp-<arch>.dll
@@ -2234,6 +2235,113 @@ static int ensure_parents_for_mount(PWSTR mountPath)
     return mkdir_recursive(buf);
 }
 
+static int cmdline_is_unmount_switch(const wchar_t *a)
+{
+    if (!a)
+        return 0;
+    return !_wcsicmp(a, L"/unmount") || !_wcsicmp(a, L"-unmount") || !_wcsicmp(a, L"--unmount") ||
+        !_wcsicmp(a, L"unmount");
+}
+
+/*
+ * Unmount a directory mount created by this tool (Dokan or WinFsp path), without knowing the PID
+ * of the serving wim.exe. Dokan: DokanRemoveMountPoint (any process). WinFsp: open the mount
+ * directory the same way FspMountSet_Directory does (DELETE_ON_CLOSE) and FspMountRemove.
+ * Drive-letter mounts: Dokan only here; WinFsp drive removal needs the hosting process or fsptool.
+ */
+static int unmount_mountpoint(PWSTR mountPath)
+{
+#if WIM_TRY_DOKAN
+    HMODULE hDokan;
+    PFN_DokanRemoveMountPoint pfnRm;
+#endif
+    wchar_t path[WIM_PATH_MAX];
+    DWORD n;
+    size_t len;
+
+    if (!mountPath || !mountPath[0]) {
+        fwprintf(stderr, L"Unmount: empty mount path.\n");
+        return 0;
+    }
+    n = GetFullPathNameW(mountPath, WIM_PATH_MAX, path, NULL);
+    if (n == 0 || n >= WIM_PATH_MAX) {
+        fwprintf(stderr, L"Unmount: GetFullPathNameW failed for \"%ls\" (%lu).\n", mountPath,
+            (unsigned long)GetLastError());
+        return 0;
+    }
+    strip_trailing_backslash(path);
+    len = wcslen(path);
+    if (len == 2 && path[1] == L':') {
+        path[2] = L'\\';
+        path[3] = 0;
+    }
+
+#if WIM_TRY_DOKAN
+    hDokan = LoadLibraryW(L"dokan.dll");
+    if (hDokan) {
+        pfnRm = (PFN_DokanRemoveMountPoint)GetProcAddress(hDokan, "DokanRemoveMountPoint");
+#if defined(_M_IX86)
+        if (!pfnRm)
+            pfnRm = (PFN_DokanRemoveMountPoint)GetProcAddress(hDokan, "_DokanRemoveMountPoint@4");
+#endif
+        if (pfnRm && pfnRm(path)) {
+            wprintf(L"Unmount (Dokan): %ls\n", path);
+            FreeLibrary(hDokan);
+            return 1;
+        }
+        FreeLibrary(hDokan);
+    }
+#endif
+
+    {
+        DWORD att = GetFileAttributesW(path);
+
+        if (att == INVALID_FILE_ATTRIBUTES || !(att & FILE_ATTRIBUTE_DIRECTORY)) {
+            fwprintf(stderr,
+                L"Unmount: \"%ls\" is not an existing directory (or Dokan unmount already removed it).\n",
+                path);
+            return 0;
+        }
+        if (!(att & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            fwprintf(stderr,
+                L"Unmount: \"%ls\" has no reparse point (not a WinFsp-style directory mount). "
+                L"If this was Dokan, ensure dokan.dll is loadable and DokanMounter is running.\n",
+                path);
+            return 0;
+        }
+    }
+
+    {
+        FSP_MOUNT_DESC desc;
+        NTSTATUS st;
+        HANDLE mh;
+
+        memset(&desc, 0, sizeof desc);
+        desc.MountPoint = path;
+        mh = CreateFileW(path, FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_DIRECTORY | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_POSIX_SEMANTICS |
+                FILE_FLAG_DELETE_ON_CLOSE,
+            NULL);
+        if (mh == INVALID_HANDLE_VALUE) {
+            fwprintf(stderr,
+                L"Unmount (WinFsp): cannot open \"%ls\" with DELETE_ON_CLOSE (error %lu). "
+                L"The serving wim.exe may still be running; stop it (Ctrl+C) then retry, "
+                L"or use WinFsp fsptool remove.\n",
+                path, (unsigned long)GetLastError());
+            return 0;
+        }
+        desc.MountHandle = mh;
+        st = FspMountRemove(&desc);
+        if (!NT_SUCCESS(st)) {
+            fwprintf(stderr, L"Unmount (WinFsp): FspMountRemove failed: 0x%08X\n", (unsigned)st);
+            return 0;
+        }
+        wprintf(L"Unmount (WinFsp): %ls\n", path);
+        return 1;
+    }
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     WimFs W;
@@ -2248,12 +2356,19 @@ int wmain(int argc, wchar_t **argv)
 
     setlocale(LC_ALL, "");
 
+    if (argc >= 3 && cmdline_is_unmount_switch(argv[1])) {
+        if (!unmount_mountpoint(argv[2]))
+            return 1;
+        return 0;
+    }
+
     if (argc < 3) {
         fwprintf(stderr,
             L"Usage: %s <archive.wim|.esd> <mount-directory> [image-index]\n"
+            L"       %s /unmount <mount-directory>   (also -unmount, --unmount, or \"unmount\" as first arg)\n"
             L"  WIMFS_BACKEND: auto (default on x86/x64: try Dokan then WinFsp), dokan, or winfsp. ARM64: WinFsp only.\n"
             L"  Diagnostics: set WIMFS_LOG=1 or add --debug to the command line; see %%TEMP%%\\wimfs_trace.log\n",
-            argv[0]);
+            argv[0], argv[0]);
         return 1;
     }
 
