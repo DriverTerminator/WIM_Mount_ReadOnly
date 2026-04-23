@@ -8,7 +8,9 @@
  * next to this exe. Optional portable kernel driver: same folder
  * winfsp-<arch>.sys (see winfsp_arch_tag_w) — on first use registers SCM service WinFsp if absent.
  * x86/x64: optional dokan.dll (Dokan 0.6.x) — try first unless WIMFS_BACKEND=winfsp. Headers from
- * third_party\dokany-0.6.0\dokan (source reference only; use official dokan.dll + dokan.sys at runtime).
+ * third_party\dokany-0.6.0\dokan (reference). Runtime: dokan.dll; optional side-by-side dokan.sys +
+ * mounter.exe — wim.exe can register/start SCM services Dokan + DokanMounter (like dokanctl /i a),
+ * or use a Dokan MSI install (System32\drivers\dokan.sys + installed mounter).
  * See third_party/wimlib/README_WINDOWS.txt: wimlib.h must come from the same CPU folder
  * as libwim.lib (x86 / x64 / arm64); versions may differ per architecture (e.g. XP vs ARM64).
  *
@@ -703,6 +705,167 @@ static void start_winfsp_service(void)
         CloseServiceHandle(scm);
     }
 }
+
+#if WIM_TRY_DOKAN
+/*
+ * Portable Dokan stack: if dokan.sys and/or mounter.exe sit next to this exe, register those paths
+ * in SCM (admin) and start "Dokan" (kernel) + "DokanMounter" (user), mirroring dokanctl /i a.
+ * If absent, do nothing so an MSI-installed Dokan still works.
+ */
+#define DOKAN_PORTABLE_DRIVER_SVC L"Dokan"
+#define DOKAN_PORTABLE_MOUNTER_SVC L"DokanMounter"
+
+static BOOL dokan_build_sys_path_next_to_exe(wchar_t *out, size_t cch)
+{
+    wchar_t exe[MAX_PATH];
+    wchar_t *slash;
+
+    if (!out || cch < MAX_PATH)
+        return FALSE;
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH))
+        return FALSE;
+    slash = wcsrchr(exe, L'\\');
+    if (!slash)
+        return FALSE;
+    slash[1] = 0;
+    if (swprintf_s(out, cch, L"%ls%ls", exe, DOKAN_DRIVER_NAME) < 0)
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL dokan_build_mounter_path_next_to_exe(wchar_t *out, size_t cch)
+{
+    wchar_t exe[MAX_PATH];
+    wchar_t *slash;
+
+    if (!out || cch < MAX_PATH)
+        return FALSE;
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH))
+        return FALSE;
+    slash = wcsrchr(exe, L'\\');
+    if (!slash)
+        return FALSE;
+    slash[1] = 0;
+    if (swprintf_s(out, cch, L"%lsmounter.exe", exe) < 0)
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL dokan_try_portable_scm_service(const wchar_t *svcName, const wchar_t *displayName,
+    DWORD serviceType, const wchar_t *binPath, const wchar_t *whatLabel)
+{
+    DWORD att;
+    SC_HANDLE scm = NULL;
+    SC_HANDLE svc = NULL;
+    BOOL ok = TRUE;
+
+    att = GetFileAttributesW(binPath);
+    if (att == INVALID_FILE_ATTRIBUTES)
+        return TRUE;
+
+    scm = OpenSCManagerW(NULL, SERVICES_ACTIVE_DATABASE,
+        SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+    if (!scm) {
+        fwprintf(stderr, L"%ls: OpenSCManagerW failed (%u). Run as administrator.\n",
+            whatLabel, (unsigned)GetLastError());
+        return FALSE;
+    }
+
+    svc = OpenServiceW(scm, svcName, SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
+    if (!svc) {
+        if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST) {
+            fwprintf(stderr, L"%ls: OpenService failed (%u).\n", whatLabel, (unsigned)GetLastError());
+            ok = FALSE;
+            goto out;
+        }
+        svc = CreateServiceW(
+            scm,
+            svcName,
+            displayName,
+            SERVICE_ALL_ACCESS,
+            serviceType,
+            SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,
+            binPath,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL);
+        if (!svc) {
+            DWORD gle = GetLastError();
+
+            if (gle == ERROR_SERVICE_EXISTS) {
+                svc = OpenServiceW(scm, svcName,
+                    SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
+            }
+            if (!svc) {
+                fwprintf(stderr, L"%ls: CreateService failed (%u).\n", whatLabel, (unsigned)gle);
+                ok = FALSE;
+                goto out;
+            }
+        }
+    }
+
+    {
+        SERVICE_STATUS ss;
+
+        if (!QueryServiceStatus(svc, &ss)) {
+            fwprintf(stderr, L"%ls: QueryServiceStatus failed (%u).\n", whatLabel,
+                (unsigned)GetLastError());
+            ok = FALSE;
+            goto out;
+        }
+        if (ss.dwCurrentState != SERVICE_RUNNING) {
+            if (!StartServiceW(svc, 0, NULL)) {
+                DWORD gle = GetLastError();
+
+                if (gle != ERROR_SERVICE_ALREADY_RUNNING) {
+                    fwprintf(stderr, L"%ls: StartService failed (%u).\n", whatLabel, (unsigned)gle);
+                    ok = FALSE;
+                    goto out;
+                }
+            }
+        }
+    }
+
+out:
+    if (svc)
+        CloseServiceHandle(svc);
+    if (scm)
+        CloseServiceHandle(scm);
+    return ok;
+}
+
+static BOOL dokan_try_portable_driver_setup(void)
+{
+    wchar_t sys_path[MAX_PATH];
+
+    if (!dokan_build_sys_path_next_to_exe(sys_path, MAX_PATH))
+        return TRUE;
+    return dokan_try_portable_scm_service(DOKAN_PORTABLE_DRIVER_SVC, DOKAN_PORTABLE_DRIVER_SVC,
+        SERVICE_FILE_SYSTEM_DRIVER, sys_path, L"Dokan portable driver");
+}
+
+static BOOL dokan_try_portable_mounter_setup(void)
+{
+    wchar_t exe_path[MAX_PATH];
+
+    if (!dokan_build_mounter_path_next_to_exe(exe_path, MAX_PATH))
+        return TRUE;
+    return dokan_try_portable_scm_service(DOKAN_PORTABLE_MOUNTER_SVC, DOKAN_PORTABLE_MOUNTER_SVC,
+        SERVICE_WIN32_OWN_PROCESS, exe_path, L"Dokan portable mounter");
+}
+
+static BOOL dokan_try_portable_stack_setup(void)
+{
+    if (!dokan_try_portable_driver_setup())
+        return FALSE;
+    if (!dokan_try_portable_mounter_setup())
+        return FALSE;
+    return TRUE;
+}
+#endif /* WIM_TRY_DOKAN */
 
 static BOOL preflight_mount(PWSTR mountPoint)
 {
@@ -1904,6 +2067,14 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
         return be == WIM_BACKEND_DOKAN ? -1 : 0;
     }
 
+    if (!dokan_try_portable_stack_setup()) {
+        fwprintf(stderr,
+            L"Dokan: registering/starting Dokan or DokanMounter failed. If dokan.sys or mounter.exe\n"
+            L"  is next to wim.exe, run as Administrator once (same idea as winfsp-*.sys portable).\n");
+        FreeLibrary(h);
+        return be == WIM_BACKEND_DOKAN ? -1 : 0;
+    }
+
     if (!mkdir_recursive(mountPath)) {
         fwprintf(stderr, L"Cannot create mount directory for Dokan.\n");
         FreeLibrary(h);
@@ -1962,6 +2133,23 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
     if (r == DOKAN_SUCCESS) {
         wprintf(L"Dokan unmounted.\n");
         return 1;
+    }
+
+    /*
+     * Dokan 0.6.x returns DOKAN_DRIVER_INSTALL_ERROR (-3) when CreateFile(L"\\\\.\\Dokan")
+     * fails inside DokanMain — i.e. dokan.sys is not loaded / device does not exist.
+     * This is not an x64 struct layout bug in the host app; Win7 x64 PE often has no driver.
+     */
+    if (r == DOKAN_DRIVER_INSTALL_ERROR) {
+        HANDLE dev = CreateFileW(L"\\\\.\\Dokan", GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (dev == INVALID_HANDLE_VALUE) {
+            fwprintf(stderr,
+                L"Dokan kernel device \\\\.\\Dokan not available (Win32 error %lu). "
+                L"Install/load dokan.sys (same Dokan build as dokan.dll).\n",
+                (unsigned long)GetLastError());
+        } else
+            CloseHandle(dev);
     }
 
     fwprintf(stderr, L"DokanMain failed (%d)%ls\n", r,
