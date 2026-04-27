@@ -1,5 +1,15 @@
-# WIM_Mount_ReadOnly
-只读挂载WIM，初始版本只为测试功能
+﻿# WIM_Mount_ReadOnly
+只读挂载WIM到一个目录
+只读挂载UD(fbinst)分区到一个目录
+参数说明：
+```
+wim.exe [/TempPath DIR] <archive.wim> <mount-directory> [image-index]
+       wim.exe /ud <\\.\PhysicalDriveN|image.fba> <mount-directory>
+       wim.exe /unmount <mount-directory>       // 卸载挂载
+  /TempPath: 临时工作目录，不指定则为%Temp%环境变量，指定的话，目录必须已存在
+  /ud: 只读挂载fbinst UD (自动判断1.6/1.7);
+```
+注意：挂载目录若不存在则wim.exe自动创建，若已存在则必须为空目录。卸载挂载后，程序不负责清理挂载目录，需要用户自行清理挂载目录。
 
 此项目中使用的第三方库列表：
 

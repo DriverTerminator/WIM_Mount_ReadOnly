@@ -241,6 +241,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.c" />
+    <ClCompile Include="ud.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

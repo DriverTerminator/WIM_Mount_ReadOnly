@@ -1,23 +1,28 @@
 ﻿/*
  * wimfs: read-only WIM/ESD/SWM image mount using WinFsp + wimlib.
  *
- * Usage: wim.exe <archive.wim|.esd> <mount-directory> [image-index]
+ * Usage: wim.exe [<--TempPath=DIR> | [--TempPath DIR]] <archive.wim|.esd> <mount-directory> [image-index]
  *         wim.exe /unmount <mount-directory>  (Dokan or WinFsp directory mounts; see unmount_mountpoint)
+ * Optional --TempPath (-TempPath, /TempPath): parent for wimlib per-file extract (default: %%TEMP%%).
+ * TempPath must already exist (caller-created). Directory mounts: caller ensures the parent path
+ * exists (e.g. D:\\). The leaf (e.g. D:\\mount) is created here before Dokan if missing; for WinFsp
+ * the leaf must not exist yet (WinFsp creates it on mount).
  *
  * Requires: wimlib (libwim.lib + libwim-*.dll). WinFsp: headers third_party\WinFsp\inc,
  * libs third_party\WinFsp\lib (winfsp-{x86|x64|a64}.lib); at runtime place winfsp-<arch>.dll
  * next to this exe. Optional portable kernel driver: same folder
  * winfsp-<arch>.sys (see winfsp_arch_tag_w) — on first use registers SCM service WinFsp if absent.
- * x86/x64: optional dokan.dll (Dokan 0.6.x) — try first unless WIMFS_BACKEND=winfsp. Headers from
+ * x86/x64: optional dokan.dll (Dokan 0.6.x) — try first unless MOUNT_BACKEND=winfsp. Headers from
  * third_party\dokany-0.6.0\dokan (reference). Runtime: dokan.dll; optional side-by-side dokan.sys +
  * mounter.exe — wim.exe can register/start SCM services Dokan + DokanMounter (like dokanctl /i a),
  * or use a Dokan MSI install (System32\drivers\dokan.sys + installed mounter).
  * See third_party/wimlib/README_WINDOWS.txt: wimlib.h must come from the same CPU folder
  * as libwim.lib (x86 / x64 / arm64); versions may differ per architecture (e.g. XP vs ARM64).
  *
- * Backends: on x86/x64, try Dokan 0.6 (dokan.dll) first unless WIMFS_BACKEND=winfsp; on failure
- * or WIMFS_BACKEND=auto (default), fall back to WinFsp. ARM64 uses WinFsp only. Set
- * WIMFS_BACKEND=dokan to require Dokan (no fallback).
+ * Backends: on x86/x64, try Dokan 0.6 (dokan.dll) first unless MOUNT_BACKEND=winfsp; on failure
+ * or MOUNT_BACKEND=auto (default), fall back to WinFsp. ARM64 uses WinFsp only. Set
+ * MOUNT_BACKEND=dokan to require Dokan (no fallback). Legacy env name WIMFS_BACKEND is still read
+ * if MOUNT_BACKEND is unset.
  */
 
 //#define UNICODE
@@ -45,6 +50,8 @@
 #include <share.h>
 #include <winsvc.h>
 #include <locale.h>
+
+#include "ud.h"
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -93,6 +100,9 @@ typedef struct WimFs {
 
     BYTE default_sd[512];
     SIZE_T default_sd_len;
+
+    /* Empty: use GetTempPathW for wimlib extract scratch; else GetTempFileNameW under this directory */
+    WCHAR scratch_root[MAX_PATH];
 } WimFs;
 
 typedef struct OpenCtx {
@@ -117,16 +127,20 @@ static int open_ctx_is_volume_root(const OpenCtx *o)
 }
 
 static WimFs *g_Wim;
-static HANDLE g_ExitEvent = 0;
-static FSP_FILE_SYSTEM *g_FsInstance;
+HANDLE g_ExitEvent = 0;
+FSP_FILE_SYSTEM *g_FsInstance;
 
 #if WIM_TRY_DOKAN
-static WCHAR g_dokanMountPath[MAX_PATH];
-static volatile LONG g_dokanMounted;
+WCHAR g_dokanMountPath[MAX_PATH];
+volatile LONG g_dokanMounted;
 typedef int(WINAPI *PFN_DokanMain)(PDOKAN_OPTIONS, PDOKAN_OPERATIONS);
 typedef BOOL(WINAPI *PFN_DokanRemoveMountPoint)(LPCWSTR);
 static PFN_DokanMain g_pfn_DokanMain;
-static PFN_DokanRemoveMountPoint g_pfn_DokanRemoveMountPoint;
+/*
+ * Shared with ud.c: Ctrl+C calls DokanRemoveMountPoint via this pointer. UD mounts load dokan.dll
+ * from ud_try_mount_dokan, not try_mount_dokan, so it must not be file-static in main.c only.
+ */
+PFN_DokanRemoveMountPoint g_DokanRemoveMountPoint;
 #endif
 
 /* Debug: set WIMFS_LOG=1, or pass --debug / -debug / /debug on the command line. Log: %TEMP%\\wimfs_trace.log */
@@ -858,7 +872,7 @@ static BOOL dokan_try_portable_mounter_setup(void)
         SERVICE_WIN32_OWN_PROCESS, exe_path, L"Dokan portable mounter");
 }
 
-static BOOL dokan_try_portable_stack_setup(void)
+BOOL dokan_try_portable_stack_setup(void)
 {
     if (!dokan_try_portable_driver_setup())
         return FALSE;
@@ -868,7 +882,7 @@ static BOOL dokan_try_portable_stack_setup(void)
 }
 #endif /* WIM_TRY_DOKAN */
 
-static BOOL preflight_mount(PWSTR mountPoint)
+BOOL preflight_mount(PWSTR mountPoint)
 {
     NTSTATUS st;
 
@@ -890,9 +904,9 @@ static BOOL preflight_mount(PWSTR mountPoint)
                 L"  and ensure the WinFsp service can start (services.msc -> WinFsp).\n");
         } else if ((unsigned)st == 0xC0000035u) {
             fwprintf(stderr,
-                L"  STATUS_OBJECT_NAME_COLLISION: mount point path already exists.\n"
-                L"  Remove that folder or pick a path that does not exist yet;\n"
-                L"  WinFsp creates the final directory when mounting.\n");
+                L"  STATUS_OBJECT_NAME_COLLISION: WinFsp directory mounts expect the mount path\n"
+                L"  not to exist yet (WinFsp creates the leaf directory). If you pre-created an empty\n"
+                L"  folder, use a parent path and let WinFsp create the final directory name, or use Dokan.\n");
         } else if ((unsigned)st == 0xC0000001u) {
             fwprintf(stderr,
                 L"  STATUS_UNSUCCESSFUL: WinFsp preflight could not complete (driver/service).\n"
@@ -901,6 +915,19 @@ static BOOL preflight_mount(PWSTR mountPoint)
         return FALSE;
     }
     return TRUE;
+}
+
+BOOL wim_mount_winfsp_stack_prepare(void)
+{
+    if (!winfsp_try_portable_driver_setup())
+        return FALSE;
+    start_winfsp_service();
+    return TRUE;
+}
+
+BOOL wim_mount_preflight(PWSTR mountPoint)
+{
+    return preflight_mount(mountPoint);
 }
 
 static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *FileSystem, FSP_FSCTL_VOLUME_INFO *VolumeInfo)
@@ -1210,7 +1237,13 @@ static int ensure_file_extracted(WimFs *W, OpenCtx *o)
         return 0;
     }
 
-    if (!GetTempPathW(MAX_PATH, dir)) {
+    if (W->scratch_root[0]) {
+        if (!GetFullPathNameW(W->scratch_root, MAX_PATH, dir, NULL) || !dir[0]) {
+            LeaveCriticalSection(&W->extract_cs);
+            return -1;
+        }
+        strip_trailing_backslash(dir);
+    } else if (!GetTempPathW(MAX_PATH, dir)) {
         LeaveCriticalSection(&W->extract_cs);
         return -1;
     }
@@ -1635,8 +1668,10 @@ static WimBackend wim_read_backend_env(void)
 {
     WCHAR b[32];
 
-    if (!GetEnvironmentVariableW(L"WIMFS_BACKEND", b, 32) || !b[0])
-        return WIM_BACKEND_AUTO;
+    if (!GetEnvironmentVariableW(L"MOUNT_BACKEND", b, 32) || !b[0]) {
+        if (!GetEnvironmentVariableW(L"WIMFS_BACKEND", b, 32) || !b[0])
+            return WIM_BACKEND_AUTO;
+    }
     if (!_wcsicmp(b, L"winfsp"))
         return WIM_BACKEND_WINFSP;
     if (!_wcsicmp(b, L"dokan"))
@@ -1644,10 +1679,9 @@ static WimBackend wim_read_backend_env(void)
     return WIM_BACKEND_AUTO;
 }
 
-static int mkdir_recursive(PWSTR path);
-static BOOL WINAPI console_ctrl(DWORD dwCtrlType);
-
 #if WIM_TRY_DOKAN
+int ensure_mount_point_dokan(PWSTR mountPath);
+
 static int DOKAN_CALLBACK dokan_CreateFile(LPCWSTR FileName, DWORD DesiredAccess, DWORD ShareMode,
     DWORD CreationDisposition, DWORD FlagsAndAttributes, PDOKAN_FILE_INFO Dfi)
 {
@@ -2031,6 +2065,8 @@ static int DOKAN_CALLBACK dokan_SetFileSecurity(LPCWSTR FileName, PSECURITY_INFO
     return -ERROR_ACCESS_DENIED;
 }
 
+static int mount_path_normalize(PWSTR mountPath, wchar_t *norm, size_t normCch);
+
 static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
 {
     HMODULE h;
@@ -2044,7 +2080,7 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
     h = LoadLibraryW(L"dokan.dll");
     if (!h) {
         if (be == WIM_BACKEND_DOKAN) {
-            fwprintf(stderr, L"dokan.dll not found (WIMFS_BACKEND=dokan).\n");
+            fwprintf(stderr, L"dokan.dll not found (MOUNT_BACKEND=dokan or legacy WIMFS_BACKEND=dokan).\n");
             return -1;
         }
         return 0;
@@ -2055,15 +2091,17 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
     if (!g_pfn_DokanMain)
         g_pfn_DokanMain = (PFN_DokanMain)GetProcAddress(h, "_DokanMain@8");
 #endif
-    g_pfn_DokanRemoveMountPoint = (PFN_DokanRemoveMountPoint)GetProcAddress(h, "DokanRemoveMountPoint");
+    g_DokanRemoveMountPoint = (PFN_DokanRemoveMountPoint)GetProcAddress(h, "DokanRemoveMountPoint");
 #if defined(_M_IX86)
-    if (!g_pfn_DokanRemoveMountPoint)
-        g_pfn_DokanRemoveMountPoint =
+    if (!g_DokanRemoveMountPoint)
+        g_DokanRemoveMountPoint =
             (PFN_DokanRemoveMountPoint)GetProcAddress(h, "_DokanRemoveMountPoint@4");
 #endif
 
-    if (!g_pfn_DokanMain || !g_pfn_DokanRemoveMountPoint) {
+    if (!g_pfn_DokanMain || !g_DokanRemoveMountPoint) {
         fwprintf(stderr, L"dokan.dll missing DokanMain/DokanRemoveMountPoint exports.\n");
+        g_pfn_DokanMain = 0;
+        g_DokanRemoveMountPoint = 0;
         FreeLibrary(h);
         return be == WIM_BACKEND_DOKAN ? -1 : 0;
     }
@@ -2072,14 +2110,17 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
         fwprintf(stderr,
             L"Dokan: registering/starting Dokan or DokanMounter failed. If dokan.sys or mounter.exe\n"
             L"  is next to wim.exe, run as Administrator once (same idea as winfsp-*.sys portable).\n");
+        g_pfn_DokanMain = 0;
+        g_DokanRemoveMountPoint = 0;
         FreeLibrary(h);
         return be == WIM_BACKEND_DOKAN ? -1 : 0;
     }
 
-    if (!mkdir_recursive(mountPath)) {
-        fwprintf(stderr, L"Cannot create mount directory for Dokan.\n");
+    if (!ensure_mount_point_dokan(mountPath)) {
+        g_pfn_DokanMain = 0;
+        g_DokanRemoveMountPoint = 0;
         FreeLibrary(h);
-        return be == WIM_BACKEND_DOKAN ? -1 : 0;
+        return -1;
     }
 
     memset(&ops, 0, sizeof ops);
@@ -2120,14 +2161,14 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
 
     g_Wim = W;
     InterlockedExchange(&g_dokanMounted, 1);
-    SetConsoleCtrlHandler(console_ctrl, TRUE);
+    SetConsoleCtrlHandler(wim_console_ctrl, TRUE);
 
     wprintf(L"Mounted image %d (Dokan) at\n  %ls\nPress Ctrl+C to unmount.\n", W->image, mountPath);
     r = g_pfn_DokanMain(&opt, &ops);
 
     InterlockedExchange(&g_dokanMounted, 0);
     g_pfn_DokanMain = 0;
-    g_pfn_DokanRemoveMountPoint = 0;
+    g_DokanRemoveMountPoint = 0;
     g_Wim = 0;
     FreeLibrary(h);
 
@@ -2155,8 +2196,14 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
 
     fwprintf(stderr, L"DokanMain failed (%d)%ls\n", r,
         (be == WIM_BACKEND_AUTO) ? L"; falling back to WinFsp" : L"");
-    if (be == WIM_BACKEND_AUTO)
-        RemoveDirectoryW(mountPath);
+    if (be == WIM_BACKEND_AUTO) {
+        wchar_t normRm[WIM_PATH_MAX];
+
+        if (mount_path_normalize(mountPath, normRm, WIM_PATH_MAX))
+            RemoveDirectoryW(normRm);
+        else
+            RemoveDirectoryW(mountPath);
+    }
 
     return be == WIM_BACKEND_DOKAN ? -1 : 0;
 }
@@ -2164,75 +2211,190 @@ static int try_mount_dokan(WimFs *W, PWSTR mountPath, WimBackend be)
 
 static FSP_FILE_SYSTEM_INTERFACE g_Interface;
 
-static BOOL WINAPI console_ctrl(DWORD dwCtrlType)
+BOOL WINAPI wim_console_ctrl(DWORD dwCtrlType)
 {
     UNREFERENCED_PARAMETER(dwCtrlType);
-#if WIM_TRY_DOKAN
-    if (g_dokanMounted && g_pfn_DokanRemoveMountPoint && g_dokanMountPath[0])
-        g_pfn_DokanRemoveMountPoint(g_dokanMountPath);
-#endif
-    if (g_FsInstance)
-        FspFileSystemStopDispatcher(g_FsInstance);
+    /*
+     * Wake the main thread first. Do not call FspFileSystemStopDispatcher here: it can
+     * block on worker threads that may still be inside our callbacks, which deadlocks
+     * Ctrl+C (seen with UD WinFsp). Teardown runs on the main thread after WaitForSingleObject.
+     */
     if (g_ExitEvent)
         SetEvent(g_ExitEvent);
+#if WIM_TRY_DOKAN
+    if (g_dokanMounted && g_DokanRemoveMountPoint && g_dokanMountPath[0])
+        g_DokanRemoveMountPoint(g_dokanMountPath);
+#endif
     return TRUE;
 }
 
-static int mkdir_recursive(PWSTR path)
+static int mount_path_normalize(PWSTR mountPath, wchar_t *norm, size_t normCch)
 {
-    wchar_t buf[WIM_PATH_MAX];
-    wchar_t *p;
+    DWORD n;
 
-    if (!path || !path[0])
+    if (!mountPath || !mountPath[0]) {
+        fwprintf(stderr, L"Mount path is empty.\n");
         return 0;
-    wcscpy_s(buf, WIM_PATH_MAX, path);
-    for (p = buf + 1; *p; p++) {
-        if (*p == L'\\') {
-            *p = 0;
-            CreateDirectoryW(buf, 0);
-            *p = L'\\';
-        }
     }
-    if (!CreateDirectoryW(buf, 0)) {
-        if (GetLastError() != ERROR_ALREADY_EXISTS)
-            return 0;
+    n = GetFullPathNameW(mountPath, (DWORD)normCch, norm, NULL);
+    if (n == 0 || n >= normCch) {
+        fwprintf(stderr, L"Mount path: GetFullPathNameW failed (%lu).\n", (unsigned long)GetLastError());
+        return 0;
+    }
+    strip_trailing_backslash(norm);
+    return 1;
+}
+
+static int mount_norm_is_drive(const wchar_t *norm)
+{
+    size_t len = wcslen(norm);
+
+    return (len == 2 && norm[1] == L':') || (len == 3 && norm[1] == L':' && norm[2] == L'\\');
+}
+
+static int verify_mount_point_drive_access(const wchar_t *norm)
+{
+    wchar_t root[8];
+    DWORD att;
+
+    if (wcslen(norm) == 2)
+        swprintf_s(root, 8, L"%ls\\", norm);
+    else
+        wcscpy_s(root, 8, norm);
+    att = GetFileAttributesW(root);
+    if (att == INVALID_FILE_ATTRIBUTES) {
+        fwprintf(stderr, L"Mount path: drive is not accessible: %ls\n", root);
+        return 0;
     }
     return 1;
 }
 
-/*
- * WinFsp directory mounts: FspMountSet creates the leaf directory and attaches the
- * reparse point. FspFileSystemPreflight therefore expects the full mount path NOT
- * to exist yet; only parent directories must exist.
- */
-static int ensure_parents_for_mount(PWSTR mountPath)
+/* Parent of a directory mount leaf (e.g. D:\\mount -> D:\\). norm is normalized, non-drive. */
+static int mount_parent_from_leaf_norm(const wchar_t *norm, wchar_t *parent, size_t parentCch)
 {
-    wchar_t buf[WIM_PATH_MAX];
     wchar_t *slash;
-    size_t len;
 
-    if (!mountPath || !mountPath[0])
+    if (!norm || !parent || parentCch < 4)
         return 0;
-    wcscpy_s(buf, WIM_PATH_MAX, mountPath);
-    strip_trailing_backslash(buf);
-    len = wcslen(buf);
-    /* Drive mount: "X:" */
-    if (len == 2 && buf[1] == L':')
-        return 1;
-
-    slash = wcsrchr(buf, L'\\');
-    if (!slash || slash == buf)
-        return 1;
-
+    wcscpy_s(parent, parentCch, norm);
+    slash = wcsrchr(parent, L'\\');
+    if (!slash || slash == parent)
+        return 0;
     *slash = 0;
-    len = wcslen(buf);
-    /* Parent is only "C:" — volume root already exists */
-    if (len == 2 && buf[1] == L':')
-        return 1;
-    if (len == 0)
-        return 1;
+    if (wcslen(parent) == 2 && parent[1] == L':') {
+        parent[2] = L'\\';
+        parent[3] = 0;
+    }
+    return 1;
+}
 
-    return mkdir_recursive(buf);
+#if WIM_TRY_DOKAN
+static int is_directory_empty_for_mount(const wchar_t *dirPath)
+{
+    wchar_t pat[WIM_PATH_MAX];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int n;
+
+    n = swprintf_s(pat, WIM_PATH_MAX, L"%ls\\*", dirPath);
+    if (n < 0 || n >= (int)WIM_PATH_MAX)
+        return 0;
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return 1;
+    do {
+        if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..")) {
+            FindClose(h);
+            return 0;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return 1;
+}
+
+/*
+ * Dokan directory mounts: parent must exist; wim.exe creates the leaf if missing (must be empty
+ * if it already exists). Drive mounts: same accessibility check as WinFsp.
+ */
+int ensure_mount_point_dokan(PWSTR mountPath)
+{
+    wchar_t norm[WIM_PATH_MAX];
+    wchar_t parent[WIM_PATH_MAX];
+    DWORD att;
+
+    if (!mount_path_normalize(mountPath, norm, WIM_PATH_MAX))
+        return 0;
+    if (mount_norm_is_drive(norm))
+        return verify_mount_point_drive_access(norm);
+
+    if (!mount_parent_from_leaf_norm(norm, parent, _countof(parent))) {
+        fwprintf(stderr, L"Dokan mount: invalid directory mount path: %ls\n", norm);
+        return 0;
+    }
+
+    att = GetFileAttributesW(parent);
+    if (att == INVALID_FILE_ATTRIBUTES || !(att & FILE_ATTRIBUTE_DIRECTORY)) {
+        fwprintf(stderr, L"Dokan mount: parent directory must already exist: %ls\n", parent);
+        return 0;
+    }
+
+    att = GetFileAttributesW(norm);
+    if (att == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(norm, NULL)) {
+            fwprintf(stderr, L"Dokan mount: cannot create mount directory \"%ls\" (%lu).\n", norm,
+                (unsigned long)GetLastError());
+            return 0;
+        }
+        return 1;
+    }
+    if (!(att & FILE_ATTRIBUTE_DIRECTORY)) {
+        fwprintf(stderr, L"Dokan mount: path exists and is not a directory: %ls\n", norm);
+        return 0;
+    }
+    if (!is_directory_empty_for_mount(norm)) {
+        fwprintf(stderr,
+            L"Dokan mount: mount directory must be empty (or not exist yet): %ls\n", norm);
+        return 0;
+    }
+    return 1;
+}
+#endif /* WIM_TRY_DOKAN */
+
+/*
+ * WinFsp: caller creates parent chain only; the leaf mount path must not exist (WinFsp creates it).
+ * Drive mounts: same drive accessibility check.
+ */
+int verify_mount_point_winfsp(PWSTR mountPath)
+{
+    wchar_t norm[WIM_PATH_MAX];
+    wchar_t parent[WIM_PATH_MAX];
+    DWORD att;
+
+    if (!mount_path_normalize(mountPath, norm, WIM_PATH_MAX))
+        return 0;
+    if (mount_norm_is_drive(norm))
+        return verify_mount_point_drive_access(norm);
+
+    if (!mount_parent_from_leaf_norm(norm, parent, _countof(parent))) {
+        fwprintf(stderr, L"WinFsp mount: invalid directory mount path: %ls\n", norm);
+        return 0;
+    }
+    att = GetFileAttributesW(parent);
+    if (att == INVALID_FILE_ATTRIBUTES || !(att & FILE_ATTRIBUTE_DIRECTORY)) {
+        fwprintf(stderr,
+            L"WinFsp mount: parent directory must already exist (create parents only): %ls\n", parent);
+        return 0;
+    }
+
+    att = GetFileAttributesW(norm);
+    if (att != INVALID_FILE_ATTRIBUTES) {
+        fwprintf(stderr,
+            L"WinFsp mount: final path must not exist yet (WinFsp will create it): %ls\n"
+            L"  Create parent folders only, not this leaf; remove the leaf if it is an empty folder.\n",
+            norm);
+        return 0;
+    }
+    return 1;
 }
 
 static int cmdline_is_unmount_switch(const wchar_t *a)
@@ -2342,6 +2504,138 @@ static int unmount_mountpoint(PWSTR mountPath)
     }
 }
 
+static int ensure_scratch_root_dir(PWSTR normPath)
+{
+    DWORD a = GetFileAttributesW(normPath);
+
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        fwprintf(stderr,
+            L"TempPath: directory does not exist: %ls\n"
+            L"  Create it (and ensure it is writable) before running wim.exe.\n",
+            normPath);
+        return 0;
+    }
+    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) {
+        fwprintf(stderr, L"TempPath: path exists but is not a directory: %ls\n", normPath);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Recognize --TempPath=DIR, --TempPath DIR, and / - forms (prefix match is case-insensitive).
+ * Updates *pi to the next unprocessed index.
+ * Returns 1 if consumed, 0 if argv[*pi] is not this option, -1 on error (prints message).
+ */
+static int consume_temp_path_option(int *pi, int argc, wchar_t **argv, wchar_t *scratch, size_t scratchCch)
+{
+    static const wchar_t *const keys[] = { L"--TempPath", L"-TempPath", L"/TempPath" };
+    unsigned k;
+    int i = *pi;
+    wchar_t *a;
+
+    if (i >= argc || !argv[i])
+        return 0;
+    a = argv[i];
+    for (k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+        size_t L = wcslen(keys[k]);
+
+        if (_wcsnicmp(a, keys[k], L) != 0)
+            continue;
+        if (a[L] == L'=') {
+            if (!a[L + 1]) {
+                fwprintf(stderr, L"%ls: directory path must not be empty.\n", keys[k]);
+                return -1;
+            }
+            if (wcslen(a + L + 1) >= scratchCch) {
+                fwprintf(stderr, L"TempPath: path too long.\n");
+                return -1;
+            }
+            wcscpy_s(scratch, scratchCch, a + L + 1);
+            strip_trailing_backslash(scratch);
+            *pi = i + 1;
+            return 1;
+        }
+        if (a[L] == 0) {
+            if (i + 1 >= argc || !argv[i + 1][0]) {
+                fwprintf(stderr, L"%ls requires a directory path argument.\n", keys[k]);
+                return -1;
+            }
+            if (wcslen(argv[i + 1]) >= scratchCch) {
+                fwprintf(stderr, L"TempPath: path too long.\n");
+                return -1;
+            }
+            wcscpy_s(scratch, scratchCch, argv[i + 1]);
+            strip_trailing_backslash(scratch);
+            *pi = i + 2;
+            return 1;
+        }
+        break;
+    }
+    return 0;
+}
+
+/*
+ * --ud / -ud / /ud: mount fbinst UD area (see ud_mount_main).
+ */
+static int consume_ud_option(int *pi, int argc, wchar_t **argv, int *udOut)
+{
+    static const wchar_t *const keys[] = { L"--ud", L"-ud", L"/ud" };
+    unsigned k;
+    int i = *pi;
+    wchar_t *a;
+
+    if (i >= argc || !argv[i])
+        return 0;
+    a = argv[i];
+    for (k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+        size_t L = wcslen(keys[k]);
+
+        if (_wcsnicmp(a, keys[k], L) != 0)
+            continue;
+        if (a[L] != 0)
+            return 0;
+        *udOut = 1;
+        *pi = i + 1;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Build scratch_root (optional) and positional args (archive, mount, [image]) from argv.
+ * Returns 0 on success; -1 on error.
+ */
+static int parse_cli_filtered(int argc, wchar_t **argv, wchar_t *scratch, size_t scratchCch,
+    wchar_t **pos, int maxPos, int *outCount, int *udMode)
+{
+    int i;
+
+    *outCount = 0;
+    *udMode = 0;
+    scratch[0] = 0;
+    for (i = 1; i < argc;) {
+        int c;
+
+        c = consume_ud_option(&i, argc, argv, udMode);
+        if (c > 0)
+            continue;
+
+        c = consume_temp_path_option(&i, argc, argv, scratch, scratchCch);
+
+        if (c < 0)
+            return -1;
+        if (c > 0)
+            continue;
+        if (*outCount >= maxPos) {
+            fwprintf(stderr, L"Too many positional arguments.\n");
+            return -1;
+        }
+        pos[(*outCount)++] = argv[i++];
+    }
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     WimFs W;
@@ -2351,31 +2645,70 @@ int wmain(int argc, wchar_t **argv)
     int wim_err;
     DWORD att;
     ULONG image = 1;
+    WimBackend mount_wb;
     PWSTR wimPath, mountPath;
     PSECURITY_DESCRIPTOR pSD = 0;
+    wchar_t scratchOpt[MAX_PATH];
+    wchar_t *posArgs[8];
+    int nPos;
+    wchar_t scratchNorm[MAX_PATH];
+    int udMode = 0;
 
     setlocale(LC_ALL, "");
 
-    if (argc >= 3 && cmdline_is_unmount_switch(argv[1])) {
-        if (!unmount_mountpoint(argv[2]))
+    if (parse_cli_filtered(argc, argv, scratchOpt, MAX_PATH, posArgs, 8, &nPos, &udMode) < 0)
+        return 1;
+
+    if (nPos >= 2 && cmdline_is_unmount_switch(posArgs[0])) {
+        if (!unmount_mountpoint(posArgs[1]))
             return 1;
         return 0;
     }
 
-    if (argc < 3) {
+    if (nPos < 2) {
         fwprintf(stderr,
-            L"Usage: %s <archive.wim|.esd> <mount-directory> [image-index]\n"
+            L"Usage: %s [--TempPath=DIR | --TempPath DIR] <archive.wim|.esd> <mount-directory> [image-index]\n"
+            L"       %s --ud <\\\\.\\PhysicalDriveN|image.bin> <mount-directory>\n"
             L"       %s /unmount <mount-directory>   (also -unmount, --unmount, or \"unmount\" as first arg)\n"
-            L"  WIMFS_BACKEND: auto (default on x86/x64: try Dokan then WinFsp), dokan, or winfsp. ARM64: WinFsp only.\n"
+            L"  --TempPath: parent directory for wimlib extract scratch (default: %%TEMP%%); must already exist.\n"
+            L"  --ud: read-only mount fbinst UD (1.6/1.7 auto); source is physical drive or FBAR .bin; admin may be required.\n"
+            L"  Mount path: ensure parent exists; leaf is created for Dokan if missing, or by WinFsp (leaf must not exist before WinFsp).\n"
+            L"  MOUNT_BACKEND: auto (default on x86/x64: try Dokan then WinFsp), dokan, or winfsp.\n"
+            L"  Legacy: WIMFS_BACKEND is used if MOUNT_BACKEND is unset. ARM64: WinFsp only.\n"
             L"  Diagnostics: set WIMFS_LOG=1 or add --debug to the command line; see %%TEMP%%\\wimfs_trace.log\n",
-            argv[0], argv[0]);
+            argv[0], argv[0], argv[0]);
         return 1;
     }
 
-    wimPath = argv[1];
-    mountPath = argv[2];
-    if (argc >= 4)
-        image = (ULONG)wcstoul(argv[3], 0, 10);
+    if (udMode) {
+        if (nPos != 2) {
+            fwprintf(stderr, L"--ud requires exactly two arguments: <source> <mount-directory>\n");
+            return 1;
+        }
+        mount_wb = wim_read_backend_env();
+        if (!ud_mount_main(posArgs[0], posArgs[1], (int)mount_wb))
+            return 1;
+        return 0;
+    }
+
+    if (scratchOpt[0]) {
+        if (!GetFullPathNameW(scratchOpt, MAX_PATH, scratchNorm, NULL) || !scratchNorm[0]) {
+            fwprintf(stderr, L"TempPath: GetFullPathNameW failed (%lu).\n", (unsigned long)GetLastError());
+            return 1;
+        }
+        strip_trailing_backslash(scratchNorm);
+        if (!ensure_scratch_root_dir(scratchNorm)) {
+            fwprintf(stderr, L"TempPath: cannot use directory: %ls\n", scratchNorm);
+            return 1;
+        }
+    }
+
+    wimPath = posArgs[0];
+    mountPath = posArgs[1];
+    if (nPos >= 3)
+        image = (ULONG)wcstoul(posArgs[2], 0, 10);
+
+    mount_wb = wim_read_backend_env();
 
     att = GetFileAttributesW(wimPath);
     if (att == INVALID_FILE_ATTRIBUTES) {
@@ -2383,13 +2716,9 @@ int wmain(int argc, wchar_t **argv)
         return 1;
     }
 
-    if (!ensure_parents_for_mount(mountPath)) {
-        fwprintf(stderr, L"Cannot create parent directories for mount path: %s (error %u)\n",
-            mountPath, (unsigned)GetLastError());
-        return 1;
-    }
-
     memset(&W, 0, sizeof W);
+    if (scratchOpt[0])
+        wcscpy_s(W.scratch_root, MAX_PATH, scratchNorm);
     InitializeCriticalSection(&W.extract_cs);
     InitializeCriticalSection(&W.open_node_cs);
 
@@ -2476,20 +2805,26 @@ int wmain(int argc, wchar_t **argv)
     wimfs_trace_fmt("main", L"ready wim=[%.200ls] mount=[%.200ls] image=%lu entries=%zu",
         wimPath, mountPath, (unsigned long)image, W.n);
 
-    {
-        WimBackend wb = wim_read_backend_env();
+#if WIM_TRY_DOKAN
+    if (mount_wb != WIM_BACKEND_WINFSP) {
+        int dr = try_mount_dokan(&W, mountPath, mount_wb);
+
+        if (dr == 1)
+            goto cleanup_and_exit_ok;
+        if (dr < 0)
+            goto fail_index;
+    }
+#endif
 
 #if WIM_TRY_DOKAN
-        if (wb != WIM_BACKEND_WINFSP) {
-            int dr = try_mount_dokan(&W, mountPath, wb);
-
-            if (dr == 1)
-                goto cleanup_and_exit_ok;
-            if (dr < 0)
-                goto fail_index;
-        }
-#endif
+    if (mount_wb != WIM_BACKEND_DOKAN) {
+        if (!verify_mount_point_winfsp(mountPath))
+            goto fail_index;
     }
+#else
+    if (!verify_mount_point_winfsp(mountPath))
+        goto fail_index;
+#endif
 
     if (!winfsp_try_portable_driver_setup())
         goto fail_index;
@@ -2561,7 +2896,7 @@ int wmain(int argc, wchar_t **argv)
         FspFileSystemDelete(fs);
         goto fail_index;
     }
-    SetConsoleCtrlHandler(console_ctrl, TRUE);
+    SetConsoleCtrlHandler(wim_console_ctrl, TRUE);
 
     status = FspFileSystemStartDispatcher(fs, 0);
     if (!NT_SUCCESS(status)) {
@@ -2583,8 +2918,13 @@ int wmain(int argc, wchar_t **argv)
     wimfs_trace_fmt("main", L"dispatcher running");
 
     WaitForSingleObject(g_ExitEvent, INFINITE);
-    CloseHandle(g_ExitEvent);
-    g_ExitEvent = 0;
+    {
+        HANDLE evW = g_ExitEvent;
+
+        g_ExitEvent = 0;
+        if (evW)
+            CloseHandle(evW);
+    }
 
     FspFileSystemStopDispatcher(fs);
     FspFileSystemRemoveMountPoint(fs);
